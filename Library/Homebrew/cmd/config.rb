@@ -1,28 +1,31 @@
-require 'hardware'
+require "hardware"
+require "software_spec"
+require "rexml/document"
+require "tap"
 
-module Homebrew extend self
+module Homebrew
   def config
     dump_verbose_config
   end
 
   def llvm
-    @llvm ||= MacOS.llvm_build_version
+    @llvm ||= MacOS.llvm_build_version if MacOS.has_apple_developer_tools?
   end
 
   def gcc_42
-    @gcc_42 ||= MacOS.gcc_42_build_version
+    @gcc_42 ||= MacOS.gcc_42_build_version if MacOS.has_apple_developer_tools?
   end
 
   def gcc_40
-    @gcc_40 ||= MacOS.gcc_40_build_version
+    @gcc_40 ||= MacOS.gcc_40_build_version if MacOS.has_apple_developer_tools?
   end
 
   def clang
-    @clang ||= MacOS.clang_version
+    @clang ||= MacOS.clang_version if MacOS.has_apple_developer_tools?
   end
 
   def clang_build
-    @clang_build ||= MacOS.clang_build_version
+    @clang_build ||= MacOS.clang_build_version if MacOS.has_apple_developer_tools?
   end
 
   def xcode
@@ -44,40 +47,71 @@ module Homebrew extend self
   end
 
   def head
-    head = HOMEBREW_REPOSITORY.cd do
-      `git rev-parse --verify -q HEAD 2>/dev/null`.chomp
-    end
-    if head.empty? then "(none)" else head end
+    Homebrew.git_head || "(none)"
+  end
+
+  def last_commit
+    Homebrew.git_last_commit || "never"
   end
 
   def origin
-    origin = HOMEBREW_REPOSITORY.cd do
-      `git config --get remote.origin.url 2>/dev/null`.chomp
-    end
-    if origin.empty? then "(none)" else origin end
+    Homebrew.git_origin || "(none)"
   end
 
-  def describe_path path
+  def core_tap_head
+    CoreTap.instance.git_head || "(none)"
+  end
+
+  def core_tap_last_commit
+    CoreTap.instance.git_last_commit || "never"
+  end
+
+  def core_tap_origin
+    CoreTap.instance.remote || "(none)"
+  end
+
+  def describe_path(path)
     return "N/A" if path.nil?
     realpath = path.realpath
-    if realpath == path then path else "#{path} => #{realpath}" end
+    if realpath == path
+      path
+    else
+      "#{path} => #{realpath}"
+    end
   end
 
   def describe_x11
     return "N/A" unless MacOS::XQuartz.installed?
-    return "#{MacOS::XQuartz.version} => #{describe_path(MacOS::XQuartz.prefix)}"
+    "#{MacOS::XQuartz.version} => #{describe_path(MacOS::XQuartz.prefix)}"
   end
 
   def describe_perl
-    describe_path(which 'perl')
+    describe_path(which "perl")
   end
 
   def describe_python
-    describe_path(which 'python')
+    python = which "python"
+    return "N/A" if python.nil?
+    python_binary = Utils.popen_read python, "-c", "import sys; sys.stdout.write(sys.executable)"
+    python_binary = Pathname.new(python_binary).realpath
+    if python == python_binary
+      python
+    else
+      "#{python} => #{python_binary}"
+    end
   end
 
   def describe_ruby
-    describe_path(which 'ruby')
+    ruby = which "ruby"
+    return "N/A" if ruby.nil?
+    ruby_binary = Utils.popen_read ruby, "-rrbconfig", "-e", \
+      'include RbConfig;print"#{CONFIG["bindir"]}/#{CONFIG["ruby_install_name"]}#{CONFIG["EXEEXT"]}"'
+    ruby_binary = Pathname.new(ruby_binary).realpath
+    if ruby == ruby_binary
+      ruby
+    else
+      "#{ruby} => #{ruby_binary}"
+    end
   end
 
   def hardware
@@ -93,61 +127,61 @@ module Homebrew extend self
     @ponk.join(", ") unless @ponk.empty?
   end
 
-  # we try to keep output minimal
-  def dump_build_config
-    puts "HOMEBREW_VERSION: #{HOMEBREW_VERSION}"
-    puts "HEAD: #{head}"
-    puts "HOMEBREW_PREFIX: #{HOMEBREW_PREFIX}" if HOMEBREW_PREFIX.to_s != "/usr/local"
-    puts "HOMEBREW_CELLAR: #{HOMEBREW_CELLAR}" if HOMEBREW_CELLAR.to_s != "#{HOMEBREW_PREFIX}/Cellar"
-    puts hardware
-    puts "OS X: #{MACOS_FULL_VERSION}-#{kernel}"
-    puts "Xcode: #{xcode}" if xcode
-    puts "CLT: #{clt}" if clt
-
-    ruby_version = MacOS.version >= "10.9" ? "2.0" : "1.8"
-    if RUBY_VERSION[/\d\.\d/] != ruby_version
-      puts "#{RUBY_PATH}:\n  #{RUBY_VERSION}-#{RUBY_PATCHLEVEL}"
+  def describe_system_ruby
+    s = ""
+    case RUBY_VERSION
+    when /^1\.[89]/, /^2\.0/
+      s << "#{RUBY_VERSION}-p#{RUBY_PATCHLEVEL}"
+    else
+      s << RUBY_VERSION
     end
 
-    unless MacOS.compilers_standard?
-      puts "GCC-4.0: build #{gcc_40}" if gcc_40
-      puts "GCC-4.2: build #{gcc_42}" if gcc_42
-      puts "LLVM-GCC: build #{llvm}"  if llvm
-      puts "Clang: #{clang ? "#{clang} build #{clang_build}" : "N/A"}"
+    if RUBY_PATH.to_s !~ %r{^/System/Library/Frameworks/Ruby.framework/Versions/[12]\.[089]/usr/bin/ruby}
+      s << " => #{RUBY_PATH}"
     end
-
-    puts "MacPorts/Fink: #{macports_or_fink}" if macports_or_fink
-
-    puts "X11: #{describe_x11}"
+    s
   end
 
-  def write_build_config f
-    stdout = $stdout
-    $stdout = f
-    Homebrew.dump_build_config
-  ensure
-    $stdout = stdout
+  def describe_java
+    java_xml = Utils.popen_read("/usr/libexec/java_home", "--xml", "--failfast")
+    return "N/A" unless $?.success?
+    javas = []
+    REXML::XPath.each(REXML::Document.new(java_xml), "//key[text()='JVMVersion']/following-sibling::string") do |item|
+      javas << item.text
+    end
+    javas.uniq.join(", ")
   end
 
-  def dump_verbose_config
-    puts "HOMEBREW_VERSION: #{HOMEBREW_VERSION}"
-    puts "ORIGIN: #{origin}"
-    puts "HEAD: #{head}"
-    puts "HOMEBREW_PREFIX: #{HOMEBREW_PREFIX}"
-    puts "HOMEBREW_CELLAR: #{HOMEBREW_CELLAR}"
-    puts hardware
-    puts "OS X: #{MACOS_FULL_VERSION}-#{kernel}"
-    puts "Xcode: #{xcode}" if xcode
-    puts "CLT: #{clt}" if clt
-    puts "GCC-4.0: build #{gcc_40}" if gcc_40
-    puts "GCC-4.2: build #{gcc_42}" if gcc_42
-    puts "LLVM-GCC: build #{llvm}"  if llvm
-    puts "Clang: #{clang ? "#{clang} build #{clang_build}" : "N/A"}"
-    puts "MacPorts/Fink: #{macports_or_fink}" if macports_or_fink
-    puts "X11: #{describe_x11}"
-    puts "System Ruby: #{RUBY_VERSION}-#{RUBY_PATCHLEVEL}"
-    puts "Perl: #{describe_perl}"
-    puts "Python: #{describe_python}"
-    puts "Ruby: #{describe_ruby}"
+  def dump_verbose_config(f = $stdout)
+    f.puts "HOMEBREW_VERSION: #{HOMEBREW_VERSION}"
+    f.puts "ORIGIN: #{origin}"
+    f.puts "HEAD: #{head}"
+    f.puts "Last commit: #{last_commit}"
+    if CoreTap.instance.installed?
+      f.puts "Core tap ORIGIN: #{core_tap_origin}"
+      f.puts "Core tap HEAD: #{core_tap_head}"
+      f.puts "Core tap last commit: #{core_tap_last_commit}"
+    else
+      f.puts "Core tap: N/A"
+    end
+    f.puts "HOMEBREW_PREFIX: #{HOMEBREW_PREFIX}"
+    f.puts "HOMEBREW_REPOSITORY: #{HOMEBREW_REPOSITORY}"
+    f.puts "HOMEBREW_CELLAR: #{HOMEBREW_CELLAR}"
+    f.puts "HOMEBREW_BOTTLE_DOMAIN: #{BottleSpecification::DEFAULT_DOMAIN}"
+    f.puts hardware
+    f.puts "OS X: #{MacOS.full_version}-#{kernel}"
+    f.puts "Xcode: #{xcode ? xcode : "N/A"}"
+    f.puts "CLT: #{clt ? clt : "N/A"}"
+    f.puts "GCC-4.0: build #{gcc_40}" if gcc_40
+    f.puts "GCC-4.2: build #{gcc_42}" if gcc_42
+    f.puts "LLVM-GCC: build #{llvm}"  if llvm
+    f.puts "Clang: #{clang ? "#{clang} build #{clang_build}" : "N/A"}"
+    f.puts "MacPorts/Fink: #{macports_or_fink}" if macports_or_fink
+    f.puts "X11: #{describe_x11}"
+    f.puts "System Ruby: #{describe_system_ruby}"
+    f.puts "Perl: #{describe_perl}"
+    f.puts "Python: #{describe_python}"
+    f.puts "Ruby: #{describe_ruby}"
+    f.puts "Java: #{describe_java}"
   end
 end

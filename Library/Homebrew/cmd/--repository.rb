@@ -1,5 +1,11 @@
-module Homebrew extend self
+require "tap"
+
+module Homebrew
   def __repository
-    puts HOMEBREW_REPOSITORY
+    if ARGV.named.empty?
+      puts HOMEBREW_REPOSITORY
+    else
+      puts ARGV.named.map { |tap| Tap.fetch(tap).path }
+    end
   end
 end
